@@ -49,6 +49,8 @@ foreach ($name in $required + $optional) {
     }
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'shaders') | Out-Null
+Copy-Item -LiteralPath (Join-Path $root 'shaders\StandaloneBoundary.fx') `
+    -Destination (Join-Path $stage 'shaders') -Force
 if (Test-Path -LiteralPath $archive) {
     Remove-Item -LiteralPath $archive
 }

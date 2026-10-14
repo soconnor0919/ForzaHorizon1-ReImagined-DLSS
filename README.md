@@ -50,6 +50,8 @@ licenses expressly permit your distribution.
 | Performance | 1280x720 | Highest reconstruction load and most ghosting risk |
 
 The launcher writes the chosen values to `ReShade.ini` immediately before starting the game.
+The package includes a disabled no-op ReShade technique so Vulkan still reaches the effects
+boundary used by the bridge when the player has no shader collection installed.
 
 ## Source
 
