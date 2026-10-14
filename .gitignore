@@ -1,0 +1,7 @@
+dist/
+.local-runtime/
+*.dll
+*.addon64
+*.log
+*.zip
+__pycache__/

@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "id": "nvidia-dlss",
+  "name": "NVIDIA DLSS",
+  "description": "Experimental DLSS Super Resolution and neural rendering bridge for NVIDIA RTX GPUs. Native uses DLAA at 2560x1440; Quality and lower modes render the 3D scene below native resolution. ReImagined does not yet expose game motion vectors, depth, or a HUD mask, so fast cars and floating labels may ghost.",
+  "platforms": ["windows"],
+  "enabled_by_default": false,
+  "requires": {
+    "settings": {
+      "gpu_backend": "vulkan"
+    }
+  },
+  "environment": {
+    "VK_INSTANCE_LAYERS": "VK_LAYER_reshade",
+    "VK_LAYER_PATH": "{mod_dir}",
+    "RESHADE_BASE_PATH_OVERRIDE": "{mod_dir}"
+  },
+  "options": [
+    {
+      "key": "super_resolution",
+      "label": "Super Resolution",
+      "type": "choice",
+      "default": "native",
+      "help": "Native keeps the game at 2560x1440 and uses DLAA. Quality can improve frame rate but may soften moving cars until ReImagined exports motion vectors.",
+      "choices": [
+        {"value": "native", "label": "Native 1440p (DLAA)"},
+        {"value": "quality", "label": "Quality (1080p to 1440p)"},
+        {"value": "balanced", "label": "Balanced (900p to 1440p)"},
+        {"value": "performance", "label": "Performance (720p to 1440p)"}
+      ],
+      "values": {
+        "native": "0",
+        "quality": "4",
+        "balanced": "3",
+        "performance": "2"
+      },
+      "ini": {"file": "ReShade.ini", "section": "Standalone.DLSSNR", "key": "SourceResolutionOverride"}
+    },
+    {
+      "key": "neural_rendering",
+      "label": "DLSS neural rendering",
+      "type": "bool",
+      "default": false,
+      "help": "Experimental neural lighting/material reconstruction. It costs performance and currently uses optical-flow fallback data.",
+      "ini": {"file": "ReShade.ini", "section": "Standalone.DLSSNR", "key": "NeuralRendering"}
+    },
+    {
+      "key": "performance_overlay",
+      "label": "DLSS performance overlay",
+      "type": "bool",
+      "default": false,
+      "help": "Shows the bridge's frame-rate and diagnostic overlay in game.",
+      "ini": {"file": "ReShade.ini", "section": "Standalone.DLSSNR", "key": "ShowProxyFps"}
+    }
+  ]
+}

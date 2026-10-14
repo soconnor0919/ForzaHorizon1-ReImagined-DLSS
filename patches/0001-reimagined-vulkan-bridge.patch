@@ -1,0 +1,375 @@
+diff --git a/addon/src/nr-standalone.cpp b/addon/src/nr-standalone.cpp
+index 3e50fd5..fb9074f 100644
+--- a/addon/src/nr-standalone.cpp
++++ b/addon/src/nr-standalone.cpp
+@@ -1,3 +1,4 @@
++// Local ReImagined change: allow public DLSS SR without the optional NR runtime.
+ #define WIN32_LEAN_AND_MEAN
+ #define NOMINMAX
+ #include <windows.h>
+@@ -130,6 +131,8 @@ static std::atomic<bool> g_proxy_transition_hold{false};
+ static std::atomic<unsigned int> g_proxy_activation_frames{0};
+ static constexpr unsigned int kProxyActivationStableFrames = 3;
+ static bool g_show_neural_output = true;
++// Local ReImagined renderer supplies a real HUD mask in the source alpha.
++static unsigned int g_reimagined_hud_protection = 0;
+ static bool g_pending_proxy_frame;
+ static bool g_composite_reshade_output = true;
+ static std::atomic<unsigned long long> g_post_reshade_frames{0};
+@@ -887,6 +890,11 @@ static FeedVk g_vulkan;
+ static reshade::api::device *g_vulkan_reshade_device;
+ static reshade::api::fence g_vulkan_fence;
+ static VkSemaphore g_vulkan_semaphore = VK_NULL_HANDLE;
++// Full-resolution HUD and color share the same capture fence as the NR input.
++static Microsoft::WRL::ComPtr<ID3D12Resource> g_reimagined_native_color;
++static VkImage g_reimagined_native_image = VK_NULL_HANDLE;
++static VkDeviceMemory g_reimagined_native_memory = VK_NULL_HANDLE;
++static bool g_reimagined_native_layout_initialized;
+ static VkImage g_vulkan_input = VK_NULL_HANDLE;
+ static VkImage g_vulkan_post = VK_NULL_HANDLE;
+ static VkDeviceMemory g_vulkan_input_memory = VK_NULL_HANDLE;
+@@ -1003,6 +1011,17 @@ static bool SourceResolutionOverrideActive()
+          g_resource_capture_height != g_resource_input_height);
+ }
+ 
++static bool ReImaginedNativeHudActive()
++{
++    return g_reimagined_hud_protection != 0 &&
++        g_present_api == reshade::api::device_api::vulkan && SourceResolutionOverrideActive();
++}
++
++static ID3D12Resource *PresentationOriginal(PipelineFrameSlot &slot)
++{
++    return ReImaginedNativeHudActive() ? slot.capture_input.Get() : slot.original_input.Get();
++}
++
+ static constexpr NVSDK_NGX_Feature kFeatureDlssNr = static_cast<NVSDK_NGX_Feature>(0x12);
+ static constexpr unsigned long long kGenericCustomCoreId = 0x0876232CULL;
+ using NgxCoreInitD3D12 = NVSDK_NGX_Result (NVSDK_CONV *)(unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version);
+@@ -2910,7 +2929,7 @@ static bool FindStandaloneRuntimeSet(wchar_t (&nr_path)[MAX_PATH],
+         Log("runtime set candidate: %ls [NR=%s SR=%s FG=%s bridge=%s]",
+             directory.c_str(), nr ? "yes" : "no", dlss ? "yes" : "no",
+             dlssg ? "yes" : "no", bridge ? "yes" : "no");
+-        if (!nr || !dlss || !bridge)
++        if (!dlss || !bridge)
+             continue;
+ 
+         wcscpy_s(nr_path, candidate_nr);
+@@ -2921,7 +2940,7 @@ static bool FindStandaloneRuntimeSet(wchar_t (&nr_path)[MAX_PATH],
+         Log("selected coherent standalone runtime set: %ls", directory.c_str());
+         return true;
+     }
+-    Log("no directory contains the complete standalone NR + SR + bridge runtime set");
++    Log("no directory contains the required SR + bridge runtime set");
+     return false;
+ }
+ 
+@@ -2935,7 +2954,9 @@ static bool InitializeNgx()
+         Fail("required private runtime dependency missing", ERROR_FILE_NOT_FOUND);
+         return false;
+     }
+-    for (const wchar_t *runtime_path : {nr_path, dlss_path, bridge_path})
++    const bool have_nr = RuntimeFileExists(nr_path);
++    if (!have_nr) { g_nr_enabled = false; Log("SR-only: optional NR runtime absent; Neural Rendering disabled"); }
++    for (const wchar_t *runtime_path : {dlss_path, bridge_path})
+     {
+         WIN32_FILE_ATTRIBUTE_DATA data = {};
+         if (!GetFileAttributesExW(runtime_path, GetFileExInfoStandard, &data)) return false;
+@@ -2957,7 +2978,7 @@ static bool InitializeNgx()
+         g_framegen_failed = true;
+     }
+ 
+-    g_nr_module = LoadLibraryExW(nr_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++    g_nr_module = have_nr ? LoadLibraryExW(nr_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) : nullptr;
+     auto nr_init = g_nr_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
+     g_nr_create = g_nr_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
+     g_nr_evaluate = g_nr_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
+@@ -2969,8 +2990,8 @@ static bool InitializeNgx()
+     g_bridge_evaluate = g_bridge_module ? reinterpret_cast<NgxBridgeEvaluateFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_EvaluateFeature")) : nullptr;
+     g_bridge_release = g_bridge_module ? reinterpret_cast<NgxBridgeReleaseFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_ReleaseFeature")) : nullptr;
+     g_bridge_populate = g_bridge_module ? reinterpret_cast<NgxBridgePopulateParameters>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_PopulateParameters")) : nullptr;
+-    if (!nr_init || !g_nr_create || !g_nr_evaluate || !g_nr_release || !bridge_init ||
+-        !g_nr_populate || !g_bridge_create || !g_bridge_evaluate || !g_bridge_release || !g_bridge_populate)
++    if ((have_nr && (!nr_init || !g_nr_create || !g_nr_evaluate || !g_nr_release || !g_nr_populate)) ||
++        !bridge_init || !g_bridge_create || !g_bridge_evaluate || !g_bridge_release || !g_bridge_populate)
+     {
+         Fail("NR snippet/caller bridge exports", static_cast<unsigned int>(GetLastError()));
+         return false;
+@@ -2990,9 +3011,11 @@ static bool InitializeNgx()
+     NVSDK_NGX_Result result = core_init(kGenericCustomCoreId, data_path, g_neural_device.Get(), NVSDK_NGX_Version_API);
+     Log("driver-core Init(app=0x%llX) = 0x%08X (%s)", kGenericCustomCoreId, static_cast<unsigned int>(result), ResultName(result));
+     if (NVSDK_NGX_FAILED(result)) { Fail("driver-core Init", static_cast<unsigned int>(result)); return false; }
++    if (have_nr) {
+     result = bridge_init(nr_init, kGenericCustomCoreId, nr_path, g_neural_device.Get(), NVSDK_NGX_Version_API, nullptr);
+     Log("NR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
+     if (NVSDK_NGX_FAILED(result)) { Fail("NR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
++    }
+ 
+     g_dlss_module = LoadLibraryExW(dlss_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+     auto dlss_init = g_dlss_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
+@@ -3024,6 +3047,7 @@ static bool InitializeNgx()
+     result = get_capabilities(&g_ngx_params);
+     Log("driver-core GetCapabilityParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned int>(result), ResultName(result), g_ngx_params);
+     if (NVSDK_NGX_FAILED(result) || !g_ngx_params) { Fail("GetCapabilityParameters", static_cast<unsigned int>(result)); return false; }
++    if (have_nr) {
+     result = g_bridge_populate(g_nr_populate, g_ngx_params);
+     Log("NR PopulateParameters_Impl = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
+     if (NVSDK_NGX_FAILED(result)) { Fail("NR PopulateParameters_Impl", static_cast<unsigned int>(result)); return false; }
+@@ -3031,6 +3055,14 @@ static bool InitializeNgx()
+     result = g_ngx_params->Get("DLSSNRComputeScalingRatioCallback", &scaling_callback);
+     g_nr_compute_scaling_ratio = reinterpret_cast<NgxPopulateParameters>(scaling_callback);
+     Log("NR scaling callback get=0x%08X ptr=%p", static_cast<unsigned int>(result), scaling_callback);
++    } else {
++        auto sr_populate = reinterpret_cast<NgxPopulateParameters>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl"));
++        if (!sr_populate) { Fail("SR populate export", ERROR_PROC_NOT_FOUND); return false; }
++        result = g_bridge_populate(sr_populate, g_ngx_params);
++        Log("SR PopulateParameters_Impl = 0x%08X", static_cast<unsigned int>(result));
++        if (NVSDK_NGX_FAILED(result)) { Fail("SR populate", static_cast<unsigned int>(result)); return false; }
++    }
++
+     return true;
+ }
+ 
+@@ -3172,6 +3204,8 @@ static NVSDK_NGX_Result SafeEvaluateFg(DWORD *exception);
+ 
+ static bool CreateFeatures()
+ {
++    // SR-only installs must never call the optional NR provider.
++    if (!g_nr_module) g_nr_enabled = false;
+     DWORD exception = 0;
+     NVSDK_NGX_Result result = NVSDK_NGX_Result_Success;
+     g_nr_second_pass_failed = false;
+@@ -4075,6 +4109,14 @@ static void ReleaseLegacyFrameResources()
+         if (g_vulkan_input_memory != VK_NULL_HANDLE) g_vulkan.FreeMemory(g_vulkan.dev, g_vulkan_input_memory, nullptr);
+         if (g_vulkan_post_memory != VK_NULL_HANDLE) g_vulkan.FreeMemory(g_vulkan.dev, g_vulkan_post_memory, nullptr);
+     }
++    if (g_vulkan.ok) {
++        if (g_reimagined_native_image) g_vulkan.DestroyImage(g_vulkan.dev, g_reimagined_native_image, nullptr);
++        if (g_reimagined_native_memory) g_vulkan.FreeMemory(g_vulkan.dev, g_reimagined_native_memory, nullptr);
++    }
++    g_reimagined_native_image = VK_NULL_HANDLE;
++    g_reimagined_native_memory = VK_NULL_HANDLE;
++    g_reimagined_native_layout_initialized = false;
++    g_reimagined_native_color.Reset();
+     g_vulkan_input = g_vulkan_post = VK_NULL_HANDLE;
+     g_vulkan_input_memory = g_vulkan_post_memory = VK_NULL_HANDLE;
+     g_vulkan_input_layout_initialized = g_vulkan_post_layout_initialized = false;
+@@ -4258,6 +4300,17 @@ static bool BuildVulkanFrameResources(UINT width, UINT height, DXGI_FORMAT forma
+         g_packed_color.Reset(); g_legacy_post12.Reset();
+         return false;
+     }
++    if (ReImaginedNativeHudActive() && !CreateSharedPairVk(
++            g_resource_capture_width, g_resource_capture_height, shared_format,
++            g_reimagined_native_color, g_reimagined_native_image, g_reimagined_native_memory))
++    {
++        ReleaseLegacyFrameResources();
++        g_packed_color.Reset(); g_legacy_post12.Reset();
++        return false;
++    }
++    if (ReImaginedNativeHudActive())
++        Log("ReImagined native HUD capture: %ux%u preserved; NR/SR work=%ux%u",
++            g_resource_capture_width, g_resource_capture_height, width, height);
+     g_legacy_width = width; g_legacy_height = height; g_legacy_format = shared_format;
+     Log("Vulkan shared frame resources ready: %ux%u game fmt=%u shared fmt=%u",
+         width, height, static_cast<unsigned int>(format), static_cast<unsigned int>(shared_format));
+@@ -4311,6 +4364,17 @@ static bool RecordVulkanFrameCopy(reshade::api::command_queue *queue,
+         FeedVkCopyImage(&g_vulkan, command_buffer, source_image,
+             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_GENERAL,
+             g_legacy_width, g_legacy_height);
++    if (!post_effects && ReImaginedNativeHudActive())
++    {
++        if (!g_reimagined_native_layout_initialized) {
++            FeedVkBarrier(&g_vulkan, command_buffer, g_reimagined_native_image,
++                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++            g_reimagined_native_layout_initialized = true;
++        }
++        FeedVkCopyImage(&g_vulkan, command_buffer, source_image,
++            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_reimagined_native_image,
++            VK_IMAGE_LAYOUT_GENERAL, g_resource_capture_width, g_resource_capture_height);
++    }
+     list->barrier(1, resources, copy_source, &source_usage);
+ 
+     if (post_effects) g_vulkan_post_copy_recorded = true;
+@@ -5271,8 +5335,8 @@ static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, D
+                         SourceResolutionOverrideActive() ?
+                         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET :
+                         D3D12_RESOURCE_FLAG_NONE)) ||
+-            (g_present_api == reshade::api::device_api::d3d12 &&
+-                SourceResolutionOverrideActive() &&
++            (((g_present_api == reshade::api::device_api::d3d12 &&
++                SourceResolutionOverrideActive()) || ReImaginedNativeHudActive()) &&
+                 !CreateTexture(capture_width, capture_height, input_format, false,
+                     D3D12_RESOURCE_STATE_COMMON, slot.capture_input)))
+             return false;
+@@ -5298,7 +5362,9 @@ static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, D
+         // sampling fence retires them.
+         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
+             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
+-            !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input))
++            !CreateTexture(ReImaginedNativeHudActive() ? capture_width : iw,
++                ReImaginedNativeHudActive() ? capture_height : ih, input_format, false,
++                D3D12_RESOURCE_STATE_COMMON, slot.original_input))
+             return false;
+         if (g_async_fg_queue && (!slot.fg_telemetry_query_heap || !slot.fg_telemetry_readback) &&
+             !CreateTimestampResources(g_neural_device.Get(), 2,
+@@ -6152,6 +6218,21 @@ static bool CaptureVulkanInputToPipelineSlot(PipelineFrameSlot &slot)
+             D3D12_RESOURCE_STATE_COMMON)
+     };
+     slot.capture_list->ResourceBarrier(2, end);
++    if (ReImaginedNativeHudActive())
++    {
++        if (!g_reimagined_native_color || !slot.capture_input) return false;
++        D3D12_RESOURCE_BARRIER native_begin[2] = {
++            Transition(g_reimagined_native_color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
++            Transition(slot.capture_input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
++        };
++        slot.capture_list->ResourceBarrier(2, native_begin);
++        slot.capture_list->CopyResource(slot.capture_input.Get(), g_reimagined_native_color.Get());
++        D3D12_RESOURCE_BARRIER native_end[2] = {
++            Transition(g_reimagined_native_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
++            Transition(slot.capture_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
++        };
++        slot.capture_list->ResourceBarrier(2, native_end);
++    }
+     hr = slot.capture_list->Close();
+     if (FAILED(hr))
+     {
+@@ -6323,7 +6404,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
+             g_legacy_capture_slots[prepared_capture_slot].capture_fence_value;
+     ID3D12Resource *real_output = pipeline_slot.real_output.Get();
+     ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
+-    ID3D12Resource *original_snapshot = pipeline_slot.original_input.Get();
++    ID3D12Resource *original_snapshot = PresentationOriginal(pipeline_slot);
+     ScopedPresentationReservation direct_reservation;
+     const bool ringed_d3d11_input = legacy_input && !mailbox_d3d11_input &&
+         g_present_api == reshade::api::device_api::d3d11;
+@@ -6874,22 +6955,24 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
+     }
+     commands->ResourceBarrier(restore_count, restore);
+ 
+-    if (original_snapshot != packed_color)
++    ID3D12Resource *snapshot_source = ReImaginedNativeHudActive() ?
++        (ringed_vulkan_input ? pipeline_slot.capture_input.Get() : g_reimagined_native_color.Get()) : packed_color;
++    if (original_snapshot != snapshot_source)
+     {
+         // Preserve the exact source frame used by this NGX submission. F10 and
+         // overlay composition can sample it without racing the next capture.
+         const D3D12_RESOURCE_STATES packed_base_state = legacy_input ?
+             D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+         D3D12_RESOURCE_BARRIER snapshot_begin[2] = {
+-            Transition(packed_color, packed_base_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
++            Transition(snapshot_source, packed_base_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+             Transition(original_snapshot, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+         };
+         commands->ResourceBarrier(2, snapshot_begin);
+-        commands->CopyResource(original_snapshot, packed_color);
++        commands->CopyResource(original_snapshot, snapshot_source);
+         const D3D12_RESOURCE_STATES packed_final_state =
+             !legacy_input && g_async_compute_active ? D3D12_RESOURCE_STATE_COMMON : packed_base_state;
+         D3D12_RESOURCE_BARRIER snapshot_end[2] = {
+-            Transition(packed_color, D3D12_RESOURCE_STATE_COPY_SOURCE, packed_final_state),
++            Transition(snapshot_source, D3D12_RESOURCE_STATE_COPY_SOURCE, packed_final_state),
+             Transition(original_snapshot, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
+         };
+         commands->ResourceBarrier(2, snapshot_end);
+@@ -6900,7 +6983,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
+         // The per-slot capture texture is both the NGX input and the immutable
+         // raw-frame source used by F10. Hand it to the graphics compositor in
+         // COMMON state after compute finishes; no redundant snapshot is needed.
+-        D3D12_RESOURCE_BARRIER input_to_common = Transition(packed_color,
++        D3D12_RESOURCE_BARRIER input_to_common = Transition(snapshot_source,
+             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+         commands->ResourceBarrier(1, &input_to_common);
+     }
+@@ -10030,7 +10113,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
+     if (SUCCEEDED(hr)) { failed_stage = "SerializeRootSignature"; hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error_blob); }
+     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
+     static const char *shader_source =
+-        "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
++        "Texture2D<float3> Neural:register(t0); Texture2D<float4> Original:register(t1); Texture2D<float3> Post:register(t2);"
+         "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;uint NoticeVisible;uint NoticeLength;uint2 NoticePadding;uint4 NoticeText[10];}"
+         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
+         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
+@@ -10061,8 +10144,9 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
+         "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0);float3 neural=Neural.SampleLevel(Samp,i.uv,0);float3 result;"
+         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
+         "uint ow,oh; Original.GetDimensions(ow,oh); uint2 op=min(uint2(i.uv*float2(ow,oh)),uint2(ow-1,oh-1));"
+-        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(op,0));"
++        "float3 postPoint=Post.Load(int3(p,0)); float4 originalPixel=Original.Load(int3(op,0)); float3 original=originalPixel.rgb;"
+         "if(Mode==0)result=original;else if(Mode==1)result=neural;else if(Mode==2)result=neural+(postPoint-original);else result=postPoint;"
++        "if(NoticePadding.x>0 && (Mode==1||Mode==2)) {float mask=step(0.5,originalPixel.a); result=lerp(result,original,mask); if(NoticePadding.x==2)result=mask.xxx;}"
+         "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
+         "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
+         "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
+@@ -10419,7 +10503,7 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
+     struct CopyEntry { ID3D12Resource *source; ID3D12Resource *destination; };
+     CopyEntry copies[3] = {
+         {pipeline.real_output.Get(), presentation.real_output.Get()},
+-        {pipeline.original_input.Get(), presentation.original_input.Get()},
++        {PresentationOriginal(pipeline), presentation.original_input.Get()},
+         {pipeline.generated_output.Get(), presentation.generated_output.Get()},
+     };
+     const UINT copy_count = pipeline.has_generated_frame ? 3u : 2u;
+@@ -10542,6 +10626,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
+     static_assert(sizeof(ProxyConstants) == 52 * sizeof(UINT));
+     constants.mode = g_composite_reshade_output && composite_post ?
+         (g_show_neural_output ? 2u : 3u) : (g_show_neural_output ? 1u : 0u);
++    constants.notice_padding[0] = g_reimagined_hud_protection;
+     constants.fps = g_proxy_fps.load();
+     constants.show_fps = g_show_proxy_fps ? 1u : 0u;
+     constants.cursor_x = cursor_x;
+@@ -10774,7 +10859,7 @@ static bool PresentPipelineFrameOnWorker(UINT slot_index)
+         return false;
+     }
+     return PresentProxySourcesOnWorker(slot.real_output.Get(), slot.generated_output.Get(),
+-        slot.original_input.Get(), slot.has_generated_frame);
++        PresentationOriginal(slot), slot.has_generated_frame);
+ }
+ 
+ static bool PresentStagedFrameOnWorker(UINT slot_index)
+@@ -11005,7 +11090,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
+     if (slot.presentation_slot_index >= 0)
+         return PublishDirectOutputSlot(slot_index);
+     ID3D12Resource *real_source = slot.real_output.Get();
+-    ID3D12Resource *original_source = slot.original_input.Get();
++    ID3D12Resource *original_source = PresentationOriginal(slot);
+     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
+         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
+         g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
+@@ -11637,7 +11722,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
+     const int external_nr_enabled = g_external_nr_enabled_request.exchange(-1, std::memory_order_acq_rel);
+     if (external_nr_enabled >= 0 && g_nr_enabled != (external_nr_enabled != 0))
+     {
+-        g_nr_enabled = external_nr_enabled != 0;
++        g_nr_enabled = external_nr_enabled != 0 && g_nr_module != nullptr;
+         reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "NeuralRendering",
+             g_nr_enabled ? "1" : "0");
+         g_need_history_reset = true;
+@@ -12735,6 +12820,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
+     ImGui::TextDisabled("Ctrl+Alt+P cycles J -> K -> L -> M. Default remains available from this menu.");
+     ImGui::TextDisabled("Render presets tune reconstruction behavior; they do not change the game's input resolution.");
+     ImGui::TextDisabled("Preset L is the recommended default; testing found noticeably less smearing at both 1080p and 1440p inputs.");
++    ImGui::BeginDisabled(g_nr_module == nullptr);
+     if (ImGui::Checkbox(dlss5_aio_menu::Label("NeuralRendering", "Enable Neural Rendering"), &g_nr_enabled))
+     {
+         reshade::set_config_value(nullptr, section, "NeuralRendering", g_nr_enabled ? "1" : "0");
+@@ -12750,6 +12836,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
+             g_nr_enabled ? "enabled" : "disabled",
+             g_nr_enabled ? "NR + DLSS SR + FG" : "DLSS SR + FG only");
+     }
++    ImGui::EndDisabled();
++    if (!g_nr_module) ImGui::TextDisabled("DLSS 5 unavailable: optional Neural Rendering runtime is not loaded.");
++    ImGui::TextWrapped("ReImagined experimental SR: motion is estimated from images using NVIDIA Optical Flow; this Vulkan path has no native game depth or camera jitter. Expect possible ghosting and added latency.");
+     ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
+     int nr_pass_index = static_cast<int>(std::clamp(g_nr_pass_count, 1u, 3u)) - 1;
+     if (ImGui::Combo("NR pass count (experimental)", &nr_pass_index,
+@@ -13247,6 +13336,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+             reshade::get_config_value(nullptr, section, key, buffer, &size);
+         };
+         char value[32];
++        read_setting("ReImaginedHudProtection", "0", value, sizeof(value));
++        g_reimagined_hud_protection = static_cast<unsigned int>(std::clamp(atoi(value), 0, 2));
++        Log("ReImagined HUD protection mode=%u (0=off, 1=restore original HUD, 2=mask debug)", g_reimagined_hud_protection);
+         // InputColorProfile is intentionally a new key. Older builds defaulted
+         // ColorProfile to HDR10 globally, so importing that value would retain
+         // the cross-game color bug instead of migrating installations to Auto.
