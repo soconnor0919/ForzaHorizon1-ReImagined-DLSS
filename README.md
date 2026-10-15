@@ -14,6 +14,11 @@ created its feature in Native/DLAA mode and processed frames. ReImagined does no
 motion vectors, depth, camera jitter, or a HUD mask to the bridge. The optical-flow fallback works,
 but moving cars and floating labels can blur or ghost. Native 1440p (DLAA) is therefore the default.
 
+Native/DLAA adds an antialiasing pass to a fully rendered frame; it is not a performance
+mode. The current source-resolution override downsamples the finished game image inside
+the bridge. It does **not** lower ReImagined's render scale or save the game's rendering
+work. See [measured performance and limitations](docs/performance.md).
+
 Frame generation is disabled. Neural rendering remains experimental and requires an additional
 NVIDIA runtime that this repository does not distribute.
 
@@ -42,12 +47,15 @@ licenses expressly permit your distribution.
 
 ## Presets
 
-| Setting | Internal source | Purpose |
+| Setting | Bridge working input | Purpose |
 |---|---:|---|
-| Native 1440p (DLAA) | 2560x1440 | Best current car and label clarity |
-| Quality | 1920x1080 | Moderate performance target |
-| Balanced | 1600x900 | Larger performance tradeoff |
-| Performance | 1280x720 | Highest reconstruction load and most ghosting risk |
+| Native 1440p (DLAA) | 2560x1440 | Full-resolution antialiasing; adds GPU work |
+| Quality | 1920x1080 | Downsampled bridge input; game rendering is unchanged |
+| Balanced | 1600x900 | Smaller bridge input; game rendering is unchanged |
+| Performance | 1280x720 | Smallest listed bridge input; game rendering is unchanged |
+
+These names currently describe reconstruction inside the bridge, not integrated game
+rendering presets. They should not be interpreted as a promise of higher frame rates.
 
 The launcher writes the chosen values to `ReShade.ini` immediately before starting the game.
 The package includes a disabled no-op ReShade technique so Vulkan still reaches the effects
